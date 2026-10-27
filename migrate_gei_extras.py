@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Restore GitHub Projects and sub-issue links after a github.com GEI migration."""
+"""Rebuild GitHub Projects and sub-issue links after a GEI migration from a
+github.com organisation to a github.com Enterprise Managed Users (EMU)
+organisation, using separate source and destination tokens."""
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -17,17 +20,33 @@ class MigrationError(RuntimeError):
     pass
 
 
+class GraphQLError(MigrationError):
+    """GitHub answered with GraphQL errors, so the outcome is known."""
+
+
+SOURCE_TOKEN_ENV = "SOURCE_GH_TOKEN"
+TARGET_TOKEN_ENV = "TARGET_GH_TOKEN"
+# Never let an ambient credential override the explicitly selected token.
+AMBIENT_TOKEN_ENVS = {"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN",
+                      "GITHUB_ENTERPRISE_TOKEN"}
+REST_VERSION = "2022-11-28"
+VIEWS_REST_VERSION = "2026-03-10"
+MANIFEST_VERSION = 2
+PENDING = "pending"
+
 FIELD_FRAGMENT = """
 __typename
-... on ProjectV2Field { id name dataType isIssueField }
+... on ProjectV2Field { id databaseId name dataType isIssueField }
 ... on ProjectV2SingleSelectField {
-  id name dataType isIssueField options { id name }
+  id databaseId name dataType isIssueField
+  options { id name color description }
 }
 ... on ProjectV2MultiSelectField {
-  id name dataType isIssueField multiSelectOptions { id name }
+  id databaseId name dataType isIssueField
+  multiSelectOptions { id name color description }
 }
 ... on ProjectV2IterationField {
-  id name dataType
+  id databaseId name dataType isIssueField
   configuration {
     duration startDay
     iterations { id title startDate duration }
@@ -49,47 +68,57 @@ __typename
 }
 """
 FRAGMENT = "fragment Field on ProjectV2FieldConfiguration {" + FIELD_FRAGMENT + "}"
+FIELD_REF = "nodes { ... on ProjectV2FieldCommon { name dataType } }"
 WRITABLE = {"TEXT", "NUMBER", "DATE", "SINGLE_SELECT", "MULTI_SELECT", "ITERATION"}
+LAYOUTS = {"TABLE_LAYOUT": "table", "BOARD_LAYOUT": "board",
+           "ROADMAP_LAYOUT": "roadmap"}
 MANUAL_CHECKS = [
-    "Recreate auto-add workflows; keep them disabled until restoration is verified.",
-    "Review every copied workflow and its enabled state before re-enabling it.",
-    "Review view filters, workflow filters, insights, and text references for old "
-    "org/repo names; native copying does not constitute reference rewriting.",
-    "Recreate collaborators, permissions, team links, and repository links.",
-    "Projects are deliberately private. Review visibility and closed/template "
-    "settings, description, and README before changing them.",
-    "Check iteration schedules, including completed iterations and breaks. "
-    "Unmatched assigned iterations block restoration rather than being guessed.",
-    "Check draft archive state, draft assignees, and mixed draft/issue item order. "
-    "Draft content and field values are handled by native copy, not rewritten.",
-    "Check source items hidden by permissions. Null/redacted project content "
-    "blocks export; the API cannot prove access to every organisation resource.",
+    "Recreate project workflows (built-in and auto-add) in the destination. "
+    "There is no API to create or enable workflows; compare the report's "
+    "source_workflows list with the destination and keep them disabled until "
+    "restoration is verified.",
+    "Recreate collaborators and team links with EMU managed users/teams. Source "
+    "accounts and teams do not exist in the EMU enterprise.",
+    "Recreate draft issue assignees with EMU managed users (not restored).",
+    "Review view filters and draft/README text for references the tool did not "
+    "rewrite (only exact mapped owner/repo names in view filters are rewritten), "
+    "including @user mentions of non-EMU accounts.",
+    "Review roadmap view date fields, zoom level, markers, column widths, field "
+    "sums, slice-by, and insights charts; these are not exposed by the API.",
+    "Projects are created private. Review visibility, closed and template "
+    "settings before changing them.",
     "Check issue-backed custom fields, issue types, assignees, labels, milestones, "
     "and dependency links separately; this tool does not migrate those values.",
-    "Projects are copied live from the source. Keep source projects and issue "
-    "hierarchies frozen from export until verification.",
+    "Check source items hidden by permissions. Null/redacted project content "
+    "blocks export; the API cannot prove access to every organisation resource.",
+    "Keep source projects and issue hierarchies frozen from export until "
+    "verification; later source changes are not migrated.",
 ]
 
 
 class API:
-    def __init__(self, delay=1.0):
+    def __init__(self, token, delay=1.0):
+        require(token, "A GitHub token is required.")
+        self.token = token
         self.delay = delay
 
     def request(self, endpoint, method="GET", payload=None, paginate=False,
-                missing_ok=False):
+                missing_ok=False, version=REST_VERSION):
         command = [
             "gh", "api", "--hostname", "github.com", "--method", method,
             "-H", "Accept: application/vnd.github+json",
-            "-H", "X-GitHub-Api-Version: 2022-11-28", endpoint,
+            "-H", f"X-GitHub-Api-Version: {version}", endpoint,
         ]
         if paginate:
             command += ["--paginate", "--slurp"]
         if payload is not None:
             command += ["--input", "-"]
+        env = {k: v for k, v in os.environ.items() if k not in AMBIENT_TOKEN_ENVS}
+        env["GH_TOKEN"] = self.token
         time.sleep(self.delay)
         result = subprocess.run(
             command, input=json.dumps(payload) if payload is not None else None,
-            text=True, capture_output=True, check=False,
+            text=True, capture_output=True, check=False, env=env,
         )
         if result.returncode:
             if missing_ok and result.stdout.strip():
@@ -110,7 +139,7 @@ class API:
             "graphql", "POST", {"query": query, "variables": variables}
         )
         if result.get("errors"):
-            raise MigrationError(json.dumps(result["errors"]))
+            raise GraphQLError(json.dumps(result["errors"]))
         return result["data"]
 
     def pages(self, query, key, **variables):
@@ -137,6 +166,14 @@ class API:
 def require(condition, message):
     if not condition:
         raise MigrationError(message)
+
+
+def api_from_env(variable, delay):
+    token = os.environ.get(variable, "").strip()
+    require(token, f"Set {variable} to the token for this step. Source and "
+                   f"destination use separate tokens ({SOURCE_TOKEN_ENV} for "
+                   f"export, {TARGET_TOKEN_ENV} for the EMU destination).")
+    return API(token, delay)
 
 
 def write_json(path, value):
@@ -175,12 +212,18 @@ def validate_repo(repo):
             f"Expected owner/repository, got {repo!r}")
 
 
+def viewer(api):
+    return api.graphql("query { viewer { login } }")["viewer"]["login"]
+
+
 def project(api, org, number):
     result = api.graphql(
         """query($org:String!,$number:Int!) {
           organization(login:$org) {
             id projectV2(number:$number) {
-              id number title url public closed shortDescription readme
+              id number title url public closed template shortDescription readme
+              repositories(first:100) { nodes { nameWithOwner } }
+              teams(first:100) { nodes { slug } }
             }
           }
         }""", org=org, number=number,
@@ -188,6 +231,22 @@ def project(api, org, number):
     require(result is not None and result["projectV2"] is not None,
             f"Project not found or inaccessible: {org}/{number}")
     return result["projectV2"]
+
+
+def workflows(api, project_id, required=True):
+    """Workflows need project admin; optional for a read-only source token."""
+    try:
+        return api.graphql(
+            """query($id:ID!) { node(id:$id) { ... on ProjectV2 {
+              workflows(first:100) { nodes { name number enabled } }
+            } } }""", id=project_id,
+        )["node"]["workflows"]["nodes"]
+    except MigrationError as error:
+        if required or "FORBIDDEN" not in str(error):
+            raise
+        print("WARNING: cannot read source project workflows (requires project "
+              "admin); they will be listed as unknown.", file=sys.stderr)
+        return None
 
 
 def fields(api, project_id):
@@ -213,7 +272,9 @@ def items(api, project_id):
                   __typename
                   ... on Issue { number title repository { nameWithOwner } }
                   ... on PullRequest { number title repository { nameWithOwner } }
-                  ... on DraftIssue { title body }
+                  ... on DraftIssue {
+                    title body assignees(first:20) { nodes { login } }
+                  }
                 }
               } pageInfo { hasNextPage endCursor }
             }
@@ -239,7 +300,17 @@ def views(api, project_id):
         """query($id:ID!,$cursor:String) {
           node(id:$id) { ... on ProjectV2 {
             views(first:100,after:$cursor) {
-              nodes { name layout filter }
+              nodes {
+                id number name layout filter
+                fields(first:100) { """ + FIELD_REF + """ }
+                groupByFields(first:10) { """ + FIELD_REF + """ }
+                verticalGroupByFields(first:10) { """ + FIELD_REF + """ }
+                sortByFields(first:10) {
+                  nodes { direction field {
+                    ... on ProjectV2FieldCommon { name dataType }
+                  } }
+                }
+              }
               pageInfo { hasNextPage endCursor }
             }
           } }
@@ -252,6 +323,7 @@ def snapshot(api, org, number):
     data["fields"] = fields(api, data["id"])
     data["items"] = items(api, data["id"])
     data["views"] = views(api, data["id"])
+    data["workflows"] = workflows(api, data["id"], required=False)
     for item in data["items"]:
         content = item["content"]
         if content and content["__typename"] in {"Issue", "PullRequest"}:
@@ -280,8 +352,11 @@ def export(api, args):
         normalized[source.lower()] = target
     require(len({r.lower() for r in normalized.values()}) == len(normalized),
             "Multiple source repositories cannot map to one destination.")
+    login = viewer(api)
+    print(f"Source identity ({SOURCE_TOKEN_ENV}): {login}", file=sys.stderr)
     manifest = {
-        "version": 1, "source_org": args.source_org, "target_org": args.target_org,
+        "version": MANIFEST_VERSION, "source_org": args.source_org,
+        "target_org": args.target_org, "source_login": login,
         "repo_map": normalized, "references": {}, "hierarchies": [], "projects": [],
         "manual_checks": MANUAL_CHECKS,
     }
@@ -396,7 +471,27 @@ def load_state(args, manifest):
         require(state["manifest_sha256"] == digest,
                 "State belongs to another manifest. Use the matching state file.")
         return state
-    return {"manifest_sha256": digest, "projects": {}}
+    return {"manifest_sha256": digest, "target_login": None, "projects": {}}
+
+
+def check_target_identity(api, manifest, state, args):
+    """Destination writes must come from the EMU identity, never the source one."""
+    login = viewer(api)
+    print(f"Destination identity ({TARGET_TOKEN_ENV}): {login}", file=sys.stderr)
+    require(login.lower() != manifest["source_login"].lower(),
+            f"{TARGET_TOKEN_ENV} belongs to the source account {login}. Use a token "
+            "for an EMU managed user in the destination enterprise.")
+    if "_" not in login:
+        print(f"WARNING: {login} does not look like an EMU managed user "
+              "(login_shortcode). Confirm the destination token.", file=sys.stderr)
+    known = state.get("target_login")
+    require(not known or known.lower() == login.lower(),
+            f"State was written by destination identity {known}; current token is "
+            f"{login}. Use the same destination identity.")
+    if getattr(args, "execute", False) and not known:
+        state["target_login"] = login
+        write_json(args.state, state)
+    return login
 
 
 def mutation(api, name, input_type, result, value):
@@ -406,67 +501,24 @@ def mutation(api, name, input_type, result, value):
     )[name]
 
 
-def comparable(value):
-    """Ignore iterations moving from current to completed as time passes."""
-    if isinstance(value, list):
-        return [comparable(item) for item in value]
-    if not isinstance(value, dict):
-        return value
-    result = {key: comparable(item) for key, item in value.items()}
-    config = result.get("configuration")
-    if isinstance(config, dict) and "completedIterations" in config:
-        config["iterations"] = sorted(
-            config.pop("iterations") + config.pop("completedIterations"),
-            key=lambda item: (item["startDate"], item["id"]),
-        )
-    return result
-
-
-def copy_projects(api, manifest, state, args):
-    preflight(api, manifest)
-    # Native copy reads the source live. Compare before any copy mutations.
-    for source in manifest["projects"]:
-        live = snapshot(api, manifest["source_org"], source["number"])
-        require(comparable(live) == comparable(source),
-                f"Project {source['number']} changed after export; re-export to a new "
-                "manifest/state before copying.")
-    owner = api.graphql(
-        "query($org:String!) { organization(login:$org) { id } }",
-        org=manifest["target_org"],
-    )["organization"]
-    require(owner is not None, "Target organisation is inaccessible.")
-    for source in manifest["projects"]:
-        key = str(source["number"])
-        entry = state["projects"].get(key)
-        if entry and entry.get("copy_pending"):
-            raise MigrationError(
-                f"Copy outcome for project {key} is uncertain. Locate the target "
-                f"project and use adopt --source-project {key} --target-project NUMBER "
-                "--execute. Do not create another copy blindly."
-            )
-        if entry is None:
-            if not args.execute:
-                print(f"DRY RUN: native-copy project {key}: {source['title']}")
-                continue
-            state["projects"][key] = {"copy_pending": True}
+def tracked_create(args, state, bucket, key, label, candidates, create):
+    """Create once. An interrupted create is recovered only by a unique match."""
+    current = bucket.get(key)
+    if current not in (None, PENDING):
+        return current
+    if current == PENDING:
+        require(len(candidates) <= 1,
+                f"Interrupted creation of {label} matches several destination "
+                "objects. Delete the unintended duplicate in GitHub, then retry.")
+        if candidates:
+            bucket[key] = candidates[0]
             write_json(args.state, state)
-            copied = mutation(
-                api, "copyProjectV2", "CopyProjectV2Input",
-                "projectV2 { id number url }",
-                {"projectId": source["id"], "ownerId": owner["id"],
-                 "title": source["title"], "includeDraftIssues": True},
-            )["projectV2"]
-            state["projects"][key] = copied
-            write_json(args.state, state)
-            entry = copied
-        if args.execute:
-            mutation(
-                api, "updateProjectV2", "UpdateProjectV2Input", "projectV2 { id }",
-                {"projectId": entry["id"], "public": False},
-            )
-            require(not project(api, manifest["target_org"], entry["number"])["public"],
-                    "Could not verify private destination project.")
-        print(f"Project {key}: {entry['url']}")
+            return candidates[0]
+    bucket[key] = PENDING
+    write_json(args.state, state)
+    bucket[key] = create()
+    write_json(args.state, state)
+    return bucket[key]
 
 
 def field_key(field):
@@ -482,9 +534,234 @@ def index_fields(values):
     return result
 
 
+def custom_fields(values):
+    return [f for f in values
+            if f["dataType"] in WRITABLE and not f.get("isIssueField")]
+
+
 def iterations(field):
     config = field["configuration"]
     return config["iterations"] + config["completedIterations"]
+
+
+def iteration_identity(item):
+    return item["title"], item["startDate"], item["duration"]
+
+
+def option_shape(option):
+    return {"name": option["name"], "color": option["color"],
+            "description": option.get("description") or ""}
+
+
+def field_definition(field):
+    """Comparable destination-independent configuration of a custom field."""
+    kind = field["dataType"]
+    if kind == "SINGLE_SELECT":
+        return [option_shape(o) for o in field["options"]]
+    if kind == "MULTI_SELECT":
+        return [option_shape(o) for o in field["multiSelectOptions"]]
+    if kind == "ITERATION":
+        return sorted(list(iteration_identity(i)) for i in iterations(field))
+    return None
+
+
+def field_input(field):
+    kind = field["dataType"]
+    if kind == "SINGLE_SELECT":
+        return {"singleSelectOptions": field_definition(field)}
+    if kind == "MULTI_SELECT":
+        return {"multiSelectOptions": field_definition(field)}
+    if kind == "ITERATION":
+        schedule = sorted(iterations(field), key=lambda i: i["startDate"])
+        start = (schedule[0]["startDate"] if schedule
+                 else datetime.date.today().isoformat())
+        return {"iterationConfiguration": {
+            "startDate": start, "duration": field["configuration"]["duration"],
+            "iterations": [{"title": i["title"], "startDate": i["startDate"],
+                            "duration": i["duration"]} for i in schedule],
+        }}
+    return {}
+
+
+def sync_fields(api, source, project_id):
+    target = index_fields(fields(api, project_id))
+    for field in custom_fields(source["fields"]):
+        existing = target.get(field_key(field))
+        if existing is None:
+            require(not any(k[0].lower() == field["name"].lower() for k in target),
+                    f"Destination field {field['name']!r} exists with another type.")
+            print(f"  Creating field {field['name']} ({field['dataType']})",
+                  file=sys.stderr)
+            mutation(api, "createProjectV2Field", "CreateProjectV2FieldInput",
+                     "projectV2Field { __typename }",
+                     dict({"projectId": project_id, "name": field["name"],
+                           "dataType": field["dataType"]}, **field_input(field)))
+        elif field_definition(existing) != field_definition(field):
+            print(f"  Updating field {field['name']} options/iterations",
+                  file=sys.stderr)
+            mutation(api, "updateProjectV2Field", "UpdateProjectV2FieldInput",
+                     "projectV2Field { __typename }",
+                     dict({"fieldId": existing["id"]}, **field_input(field)))
+    return index_fields(fields(api, project_id))
+
+
+def rewrite_repos(text, repo_map):
+    """Rewrite exact mapped owner/repo names; everything else is left unchanged."""
+    text = text or ""
+    for source in sorted(repo_map, key=len, reverse=True):
+        text = re.sub(r"(?<![\w.-])" + re.escape(source) + r"(?![\w.-])",
+                      lambda _match, t=repo_map[source]: t, text, flags=re.I)
+    return text
+
+
+def view_shape(view, repo_map=None):
+    names = lambda connection: [
+        [n["name"], n["dataType"]] for n in connection["nodes"] if n
+    ]
+    roadmap = view["layout"] == "ROADMAP_LAYOUT"
+    return {
+        "name": view["name"], "layout": view["layout"],
+        "filter": (rewrite_repos(view.get("filter"), repo_map) if repo_map
+                   else view.get("filter") or ""),
+        "visible": [] if roadmap else names(view["fields"]),
+        "group": names(view["groupByFields"]),
+        "vertical": names(view["verticalGroupByFields"]),
+        "sort": [[s["field"]["name"], s["field"]["dataType"], s["direction"]]
+                 for s in view["sortByFields"]["nodes"] if s and s["field"]],
+    }
+
+
+def view_payload(shape, target_fields):
+    by_key = {key: field["databaseId"] for key, field in target_fields.items()}
+
+    def ids(entries):
+        result = []
+        for entry in entries:
+            key = (entry[0], entry[1])
+            require(key in by_key,
+                    f"View {shape['name']!r} uses field {entry[0]!r} ({entry[1]}), "
+                    "which does not exist in the destination project.")
+            result.append(by_key[key])
+        return result
+
+    payload = {"name": shape["name"], "layout": LAYOUTS[shape["layout"]]}
+    if shape["filter"]:
+        payload["filter"] = shape["filter"]
+    if shape["visible"]:
+        payload["visible_fields"] = ids(shape["visible"])
+    if shape["sort"]:
+        payload["sort_by"] = [[i, s[2].lower()]
+                              for i, s in zip(ids(shape["sort"]), shape["sort"])]
+    if shape["group"]:
+        payload["group_by"] = ids(shape["group"])
+    if shape["vertical"]:
+        payload["vertical_group_by"] = ids(shape["vertical"])
+    return payload
+
+
+def link_repositories(api, manifest, source, target):
+    linked = {r["nameWithOwner"].lower() for r in target["repositories"]["nodes"]}
+    for repo in source["repositories"]["nodes"]:
+        mapped = manifest["repo_map"].get(repo["nameWithOwner"].lower())
+        if not mapped or mapped.lower() in linked:
+            continue
+        owner, name = mapped.split("/")
+        repository = api.graphql(
+            "query($o:String!,$n:String!) { repository(owner:$o,name:$n) { id } }",
+            o=owner, n=name,
+        )["repository"]
+        require(repository is not None, f"Destination repository missing: {mapped}")
+        print(f"  Linking repository {mapped}", file=sys.stderr)
+        mutation(api, "linkProjectV2ToRepository", "LinkProjectV2ToRepositoryInput",
+                 "repository { id }",
+                 {"projectId": target["id"], "repositoryId": repository["id"]})
+
+
+def create_projects(api, manifest, state, args):
+    check_target_identity(api, manifest, state, args)
+    owner = api.graphql(
+        "query($org:String!) { organization(login:$org) { id } }",
+        org=manifest["target_org"],
+    )["organization"]
+    require(owner is not None, "Target organisation is inaccessible.")
+    repo_map = manifest["repo_map"]
+    for source in manifest["projects"]:
+        key = str(source["number"])
+        entry = state["projects"].get(key)
+        if entry and entry.get("create_pending"):
+            raise MigrationError(
+                f"Creation outcome for project {key} is uncertain. Locate the new "
+                f"destination project and use adopt --source-project {key} "
+                "--target-project NUMBER --execute. Do not create another blindly."
+            )
+        if not args.execute:
+            print(f"DRY RUN: {'continue' if entry else 'create'} project {key} "
+                  f"{source['title']!r}: {len(custom_fields(source['fields']))} "
+                  f"custom fields, {len(source['views'])} views, "
+                  f"{len(source['repositories']['nodes'])} repository links.")
+            for view in source["views"]:
+                shape = view_shape(view, repo_map)
+                if shape["filter"] != (view.get("filter") or ""):
+                    print(f"  View {view['name']!r} filter rewritten to: "
+                          f"{shape['filter']}")
+            continue
+        if entry is None:
+            state["projects"][key] = {"create_pending": True}
+            write_json(args.state, state)
+            try:
+                created = mutation(
+                    api, "createProjectV2", "CreateProjectV2Input",
+                    "projectV2 { id number url }",
+                    {"ownerId": owner["id"], "title": source["title"]},
+                )["projectV2"]
+            except GraphQLError:
+                # A GraphQL error response means nothing was created.
+                del state["projects"][key]
+                write_json(args.state, state)
+                raise
+            entry = dict(created, default_views=None, views={}, drafts={})
+            state["projects"][key] = entry
+            write_json(args.state, state)
+        if entry.get("default_views") is None:
+            entry["default_views"] = [v["id"] for v in views(api, entry["id"])]
+            write_json(args.state, state)
+        print(f"Building project {key} -> {entry['url']}", file=sys.stderr)
+        mutation(
+            api, "updateProjectV2", "UpdateProjectV2Input", "projectV2 { id }",
+            {"projectId": entry["id"], "public": False,
+             "shortDescription": source.get("shortDescription") or "",
+             "readme": source.get("readme") or ""},
+        )
+        target_fields = sync_fields(api, source, entry["id"])
+        link_repositories(api, manifest, source,
+                          project(api, manifest["target_org"], entry["number"]))
+        for view in source["views"]:
+            shape = view_shape(view, repo_map)
+            mapped = set(entry["views"].values())
+            candidates = [v["id"] for v in views(api, entry["id"])
+                          if v["name"] == shape["name"] and v["id"] not in mapped
+                          and v["id"] not in entry["default_views"]]
+
+            def create_view(shape=shape):
+                print(f"  Creating view {shape['name']}", file=sys.stderr)
+                return api.request(
+                    f"orgs/{manifest['target_org']}/projectsV2/{entry['number']}/views",
+                    "POST", view_payload(shape, target_fields),
+                    version=VIEWS_REST_VERSION,
+                )["node_id"]
+
+            tracked_create(args, state, entry["views"], str(view["number"]),
+                           f"view {shape['name']!r}", candidates, create_view)
+        present = {v["id"] for v in views(api, entry["id"])}
+        for view_id in entry["default_views"]:
+            if view_id in present and view_id not in entry["views"].values():
+                mutation(api, "deleteProjectV2View", "DeleteProjectV2ViewInput",
+                         "projectV2View { id }", {"viewId": view_id})
+        entry["default_views"] = []
+        write_json(args.state, state)
+        require(not project(api, manifest["target_org"], entry["number"])["public"],
+                "Could not verify private destination project.")
+        print(f"Project {key}: {entry['url']}")
 
 
 def unique_match(values, description):
@@ -514,9 +791,9 @@ def mapped_value(value, source_field, target_field):
         [item for item in iterations(source_field) if item["id"] == value["iterationId"]],
         f"source iteration {value['iterationId']}",
     )
-    identity = lambda item: (item["title"], item["startDate"], item["duration"])
     target = unique_match(
-        [item for item in iterations(target_field) if identity(item) == identity(old)],
+        [item for item in iterations(target_field)
+         if iteration_identity(item) == iteration_identity(old)],
         f"iteration {old['title']} / {old['startDate']} / {old['duration']}",
     )
     return {"iterationId": target["id"]}
@@ -534,65 +811,113 @@ def desired_values(source, target_fields):
     return result
 
 
+def draft_identity(content):
+    return content["title"], content.get("body") or ""
+
+
 def project_plan(api, manifest, state, resolved):
     plans = []
     for source in manifest["projects"]:
         entry = state["projects"].get(str(source["number"]))
-        require(entry is not None and not entry.get("copy_pending"),
-                f"Project {source['number']} is not copied; run copy/adopt first.")
+        require(entry is not None and not entry.get("create_pending")
+                and entry.get("default_views") == [],
+                f"Project {source['number']} is not fully created; run create "
+                "(or adopt then create) first.")
         target = project(api, manifest["target_org"], entry["number"])
         require(target["id"] == entry["id"], "Target project identity changed.")
         require(not target["public"],
-                "Destination project is public. Run copy --execute to enforce "
+                "Destination project is public. Run create --execute to enforce "
                 "private visibility before restoration.")
-        source_fields = index_fields(source["fields"])
         target_fields = index_fields(fields(api, target["id"]))
-        require(source_fields.keys() == target_fields.keys(),
-                f"Project {source['number']}: source/target field names or types differ.")
-        same_view = lambda v: dict(v, filter=v.get("filter") or "")
-        require([same_view(v) for v in views(api, target["id"])] ==
-                [same_view(v) for v in source["views"]],
-                f"Project {source['number']}: view names/layouts/filters differ. "
-                "Run restoration before manually editing view filters.")
-        existing = {}
+        expected = {field_key(f): field_definition(f)
+                    for f in custom_fields(source["fields"])}
+        actual = {field_key(f): field_definition(f)
+                  for f in custom_fields(target_fields.values())}
+        require(expected == actual,
+                f"Project {source['number']}: destination custom fields, options or "
+                "iterations differ from the export. Rerun create or fix the project.")
+        require([view_shape(v) for v in views(api, target["id"])] ==
+                [view_shape(v, manifest["repo_map"]) for v in source["views"]],
+                f"Project {source['number']}: view names/layouts/filters/fields/"
+                "grouping/sorting differ. Do not edit views before verification.")
+        existing, drafts = {}, {}
         for item in items(api, target["id"]):
             content = item["content"]
             require(content is not None, "Target has inaccessible project content.")
             if content["__typename"] == "DraftIssue":
+                drafts[item["id"]] = item
                 continue
             key = ref(content["repository"]["nameWithOwner"], content["number"])
             require(key not in existing, f"Duplicate target project item: {key}")
             existing[key] = item
+        mapped_drafts = {v for v in entry["drafts"].values() if v != PENDING}
+        for source_id, target_id in entry["drafts"].items():
+            require(target_id == PENDING or target_id in drafts,
+                    f"Restored draft item {target_id} is missing from the destination.")
+        pending_identities = {
+            draft_identity(i["content"]) for i in source["items"]
+            if entry["drafts"].get(i["id"]) == PENDING
+        }
+        require(all(item_id in mapped_drafts or
+                    draft_identity(item["content"]) in pending_identities
+                    for item_id, item in drafts.items()),
+                f"Project {source['number']} has unexpected draft items; review the "
+                "project and remove items not created by this tool.")
         wanted = set()
         planned = []
         for item in source["items"]:
-            if "reference" not in item:
+            values = desired_values(item, target_fields)
+            if item["content"]["__typename"] == "DraftIssue":
+                target_id = entry["drafts"].get(item["id"])
+                identity = draft_identity(item["content"])
+                planned.append({
+                    "kind": "DraftIssue", "source": item, "label": identity[0],
+                    "existing": drafts.get(target_id),
+                    "candidates": [i for i, d in drafts.items()
+                                   if i not in mapped_drafts
+                                   and draft_identity(d["content"]) == identity],
+                    "values": values,
+                })
                 continue
             dest = resolved[item["reference"]]
             key = ref(dest["repo"], dest["number"])
             wanted.add(key)
             planned.append({
-                "source": item, "destination": dest, "existing": existing.get(key),
-                "values": desired_values(item, target_fields),
+                "kind": "Content", "source": item, "label": item["reference"],
+                "destination": dest, "existing": existing.get(key), "values": values,
             })
         require(set(existing) <= wanted,
                 f"Project {source['number']} has unexpected target issue/PR items; "
-                "pause auto-add workflows and review the project.")
-        plans.append({"target": target, "items": planned})
+                "disable auto-add workflows and review the project.")
+        target["workflows"] = workflows(api, target["id"])
+        plans.append({"source": source, "target": target, "entry": entry,
+                      "items": planned})
     return plans
 
 
+def enabled_workflows(plans):
+    return [f"{plan['target']['url']}: {workflow['name']}"
+            for plan in plans for workflow in plan["target"]["workflows"]
+            if workflow["enabled"]]
+
+
 def restore(api, manifest, state, args):
+    check_target_identity(api, manifest, state, args)
     resolved = preflight(api, manifest)
     plans = project_plan(api, manifest, state, resolved)
+    enabled = enabled_workflows(plans)
     if not args.execute:
-        print(f"DRY RUN: restore {sum(len(p['items']) for p in plans)} issue/PR "
-              f"project items and {sum(len(h['children']) for h in manifest['hierarchies'])} "
+        print(f"DRY RUN: restore {sum(len(p['items']) for p in plans)} project items "
+              f"and {sum(len(h['children']) for h in manifest['hierarchies'])} "
               "sub-issue links. All preflight mappings passed; no remote writes.")
+        if enabled:
+            print("Disable these destination workflows before --execute:\n  "
+                  + "\n  ".join(enabled))
         return
-    require(args.workflows_paused,
-            "Pause destination project workflows first, then pass --workflows-paused. "
-            "Copied workflows can change issue state while values are restored.")
+    require(not enabled,
+            "Destination project workflows are enabled and could change items "
+            "while values are restored. Disable them in the project settings:\n  "
+            + "\n  ".join(enabled))
     write_json(args.report, {
         "automated_checks": "not_completed",
         "manual_review_required": manifest["manual_checks"],
@@ -610,7 +935,8 @@ def restore(api, manifest, state, args):
             api.request(endpoint + "/priority", "PATCH",
                         {"sub_issue_id": child["id"], "after_id": previous["id"]})
     for plan in plans:
-        target = plan["target"]
+        target, entry = plan["target"], plan["entry"]
+        # Items are added in source order, preserving relative manual ordering.
         for item in plan["items"]:
             if item["existing"]:
                 item_id = item["existing"]["id"]
@@ -619,6 +945,17 @@ def restore(api, manifest, state, args):
                         api, "unarchiveProjectV2Item", "UnarchiveProjectV2ItemInput",
                         "item { id }", {"projectId": target["id"], "itemId": item_id},
                     )
+            elif item["kind"] == "DraftIssue":
+                title, body = draft_identity(item["source"]["content"])
+                item_id = tracked_create(
+                    args, state, entry["drafts"], item["source"]["id"],
+                    f"draft {title!r}", item["candidates"],
+                    lambda title=title, body=body: mutation(
+                        api, "addProjectV2DraftIssue", "AddProjectV2DraftIssueInput",
+                        "projectItem { id }",
+                        {"projectId": target["id"], "title": title, "body": body},
+                    )["projectItem"]["id"],
+                )
             else:
                 item_id = mutation(
                     api, "addProjectV2ItemById", "AddProjectV2ItemByIdInput",
@@ -653,6 +990,7 @@ def verify(api, manifest, state, args):
         "automated_checks": "not_completed",
         "manual_review_required": manifest["manual_checks"],
     })
+    check_target_identity(api, manifest, state, args)
     resolved = preflight(api, manifest)
     plans = project_plan(api, manifest, state, resolved)
     for hierarchy in manifest["hierarchies"]:
@@ -667,36 +1005,70 @@ def verify(api, manifest, state, args):
     for plan in plans:
         for item in plan["items"]:
             actual = item["existing"]
-            require(actual is not None,
-                    f"Project item missing: {item['source']['reference']}")
+            require(actual is not None, f"Project item missing: {item['label']}")
+            if item["kind"] == "DraftIssue":
+                require(draft_identity(actual["content"]) ==
+                        draft_identity(item["source"]["content"]),
+                        f"Draft title/body mismatch: {item['label']}")
             require(actual["isArchived"] == item["source"]["isArchived"],
-                    f"Archive mismatch: {item['source']['reference']}")
+                    f"Archive mismatch: {item['label']}")
             actual_values = {field_key(v["field"]): v
                              for v in actual["values"] if "field" in v}
             for field, expected in item["values"]:
                 raw = actual_values.get(field_key(field))
                 observed = mapped_value(raw, field, field) if raw else None
                 require(observed == expected,
-                        f"Field mismatch: {item['source']['reference']} / {field['name']}")
+                        f"Field mismatch: {item['label']} / {field['name']}")
             count += 1
+    projects = manifest["projects"]
     write_json(args.report, {
         "automated_checks": "passed",
-        "project_issue_pr_items_verified": count,
+        "project_items_verified": count,
         "sub_issue_links_verified": sum(len(h["children"]) for h in manifest["hierarchies"]),
-        "destination_projects": state["projects"],
+        "destination_projects": {
+            k: {"id": v["id"], "number": v["number"], "url": v["url"]}
+            for k, v in state["projects"].items()
+        },
         "manual_review_required": manifest["manual_checks"],
+        "source_workflows": [
+            {"source_project": p["number"], "name": w["name"], "enabled": w["enabled"]}
+            for p in projects for w in (p["workflows"] or [])
+        ],
+        "source_workflows_unreadable": [
+            p["number"] for p in projects if p["workflows"] is None
+        ],
+        "source_teams_not_linked": [
+            {"source_project": p["number"], "team": t["slug"]}
+            for p in projects for t in p["teams"]["nodes"]
+        ],
+        "source_repository_links_not_mapped": [
+            {"source_project": p["number"], "repository": r["nameWithOwner"]}
+            for p in projects for r in p["repositories"]["nodes"]
+            if r["nameWithOwner"].lower() not in manifest["repo_map"]
+        ],
+        "source_project_settings_not_applied": [
+            {"source_project": p["number"], "closed": p["closed"],
+             "template": p["template"], "public": p["public"]}
+            for p in projects if p["closed"] or p["template"] or p["public"]
+        ],
+        "draft_assignees_not_restored": [
+            {"source_project": p["number"], "draft": i["content"]["title"],
+             "assignees": [a["login"] for a in i["content"]["assignees"]["nodes"]]}
+            for p in projects for i in p["items"]
+            if i["content"]["__typename"] == "DraftIssue"
+            and i["content"].get("assignees", {}).get("nodes")
+        ],
         "fields_not_restored_by_this_tool": [
             {"source_project": source["number"], "name": field["name"],
              "data_type": field["dataType"],
              "issue_backed": bool(field.get("isIssueField"))}
-            for source in manifest["projects"] for field in source["fields"]
+            for source in projects for field in source["fields"]
             if field["dataType"] not in WRITABLE or field.get("isIssueField")
         ],
         "not_verified": [
-            "Full view configuration, sorting/grouping details and insights",
             "Workflow definitions and enabled states",
-            "Draft content/values/assignees/archive/order fidelity",
-            "Unassigned iteration schedules and breaks",
+            "Roadmap date fields/zoom, column widths, field sums, slice-by, insights",
+            "Collaborators, team links and draft assignees",
             "Issue-backed fields and other GEI-managed issue metadata",
         ],
     })
@@ -704,17 +1076,34 @@ def verify(api, manifest, state, args):
 
 
 def adopt(api, manifest, state, args):
-    require(any(p["number"] == args.source_project for p in manifest["projects"]),
-            "Source project is not in the manifest.")
+    check_target_identity(api, manifest, state, args)
+    source = next((p for p in manifest["projects"]
+                   if p["number"] == args.source_project), None)
+    require(source is not None, "Source project is not in the manifest.")
     target = project(api, manifest["target_org"], args.target_project)
     key = str(args.source_project)
     old = state["projects"].get(key)
-    require(not old or old.get("copy_pending") or old.get("id") == target["id"],
+    require(not old or old.get("create_pending") or old.get("id") == target["id"],
             "State already points to a different target project.")
     require(all(p.get("id") != target["id"] for k, p in state["projects"].items()
                 if k != key), "Target project already maps to another source.")
+    if not old or old.get("create_pending"):
+        # create rewrites settings and deletes existing views of an adopted
+        # project, so only accept one that looks freshly created.
+        require(target["title"] == source["title"],
+                f"Target title {target['title']!r} does not match source title "
+                f"{source['title']!r}; refusing to adopt.")
+        require(not items(api, target["id"]),
+                "Target project already has items; refusing to adopt.")
+        require(len(views(api, target["id"])) <= 1,
+                "Target project has more than one view; refusing to adopt.")
     if args.execute:
-        state["projects"][key] = {k: target[k] for k in ("id", "number", "url")}
+        if not old or old.get("create_pending"):
+            # Views present at adoption are the auto-created defaults to replace.
+            state["projects"][key] = dict(
+                {k: target[k] for k in ("id", "number", "url")},
+                default_views=None, views={}, drafts={},
+            )
         write_json(args.state, state)
     print(f"{'Adopted' if args.execute else 'DRY RUN: adopt'} {target['url']}")
 
@@ -724,36 +1113,37 @@ def main():
     parser.add_argument("--delay", type=float, default=1.0,
                         help="Seconds between API calls (default: 1).")
     sub = parser.add_subparsers(dest="command", required=True)
-    exp = sub.add_parser("export", help="Read-only source snapshot; no destination writes.")
+    exp = sub.add_parser(
+        "export", help=f"Read-only source snapshot using {SOURCE_TOKEN_ENV}.")
     exp.add_argument("--source-org", required=True)
     exp.add_argument("--target-org", required=True)
     exp.add_argument("--repo-map", required=True)
     exp.add_argument("--project", action="append", type=int, default=[],
                      help="Source project number; repeat for multiple projects.")
     exp.add_argument("--manifest", required=True)
-    for command in ("copy", "restore", "verify", "adopt"):
-        cmd = sub.add_parser(command)
+    for command in ("create", "restore", "verify", "adopt"):
+        cmd = sub.add_parser(
+            command, help=f"Destination step using {TARGET_TOKEN_ENV}.")
         cmd.add_argument("--manifest", required=True)
         cmd.add_argument("--state", required=True)
         cmd.add_argument("--report", default="migration-report.json")
         if command != "verify":
             cmd.add_argument("--execute", action="store_true",
                              help="Allow destination writes; otherwise read-only dry run.")
-        if command == "restore":
-            cmd.add_argument("--workflows-paused", action="store_true")
         if command == "adopt":
             cmd.add_argument("--source-project", type=int, required=True)
             cmd.add_argument("--target-project", type=int, required=True)
     args = parser.parse_args()
     require(args.delay >= 0, "--delay must not be negative.")
-    api = API(args.delay)
     if args.command == "export":
-        export(api, args)
+        export(api_from_env(SOURCE_TOKEN_ENV, args.delay), args)
         return
     manifest = read_json(args.manifest)
-    require(manifest["version"] == 1, "Unsupported manifest version.")
+    require(manifest.get("version") == MANIFEST_VERSION,
+            "Unsupported manifest version; export a new manifest with this tool.")
     state = load_state(args, manifest)
-    {"copy": copy_projects, "restore": restore,
+    api = api_from_env(TARGET_TOKEN_ENV, args.delay)
+    {"create": create_projects, "restore": restore,
      "verify": verify, "adopt": adopt}[args.command](api, manifest, state, args)
 
 
