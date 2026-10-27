@@ -490,6 +490,7 @@ class Tests(unittest.TestCase):
             }, {
                 "kind": "Content", "source": {"isArchived": True},
                 "destination": {"node_id": "ISSUE"}, "existing": None,
+                "key": "new/repo#1",
                 "values": [(definition, {"number": 0}), (field(), None)],
             }],
         }]
@@ -497,6 +498,7 @@ class Tests(unittest.TestCase):
             return {"item": {"id": "ITEM"}, "projectItem": {"id": "DRAFT"}}
         with patch.object(m, "preflight", return_value={}), \
                 patch.object(m, "project_plan", return_value=plan), \
+                patch.object(m, "remove_auto_added"), \
                 patch.object(m, "verify"), \
                 patch.object(m, "write_json"), \
                 patch.object(m, "mutation", side_effect=mutate) as mutation:
@@ -509,6 +511,68 @@ class Tests(unittest.TestCase):
             self.assertEqual(mutation.call_args_list[0].args[-1]["body"], "Text")
             self.assertEqual(mutation.call_args_list[3].args[-1]["value"], {"number": 0})
             self.assertEqual(entry["drafts"], {"SRC_DRAFT": "DRAFT"})
+
+    def test_descendants_follow_restored_hierarchy(self):
+        manifest = {"hierarchies": [
+            {"parent": "old/a#1", "children": ["old/a#2", "old/b#1"]},
+            {"parent": "old/a#2", "children": ["old/a#3"]},
+            {"parent": "old/a#9", "children": ["old/a#8"]},
+        ]}
+        resolved = {k: {"repo": k.split("#")[0].replace("old/", "new/"),
+                        "number": int(k.split("#")[1])}
+                    for k in ["old/a#1", "old/a#2", "old/a#3", "old/b#1",
+                              "old/a#8", "old/a#9"]}
+        self.assertEqual(m.descendant_refs(manifest, resolved, {"new/a#1"}),
+                         {"new/a#2", "new/a#3", "new/b#1"})
+
+    def test_add_item_reuses_auto_added_item(self):
+        api = FakeAPI()
+        api.graphql = lambda q, **v: {"node": {"projectItems": {"nodes": [
+            {"id": "OTHER", "project": {"id": "ELSEWHERE"}},
+            {"id": "EXISTING", "project": {"id": "P"}}]}}}
+        with patch.object(m, "mutation", side_effect=m.GraphQLError(
+                "Content already exists in this project")):
+            self.assertEqual(m.add_item(api, "P", "ISSUE"), "EXISTING")
+        with patch.object(m, "mutation", side_effect=m.GraphQLError("FORBIDDEN")):
+            with self.assertRaises(m.GraphQLError):
+                m.add_item(api, "P", "ISSUE")
+
+    def test_restore_links_sub_issues_after_items_then_sweeps(self):
+        manifest, api = self.manifest(), FakeAPI()
+        manifest["hierarchies"] = [{"parent": "old/repo#1", "children": []}]
+        order = []
+        api.rest_list = lambda endpoint: order.append("hierarchy") or []
+        plan = [{"target": {"id": "P", "workflows": []}, "entry": {"drafts": {}},
+                 "items": [{"kind": "Content", "source": {"isArchived": False},
+                            "destination": {"node_id": "I"}, "existing": None,
+                            "key": "new/repo#1", "values": []}]}]
+        with patch.object(m, "preflight",
+                          return_value={"old/repo#1": {"repo": "new/repo",
+                                                       "number": 1}}), \
+                patch.object(m, "project_plan", return_value=plan), \
+                patch.object(m, "add_item",
+                             side_effect=lambda *a: order.append("item") or "X"), \
+                patch.object(m, "remove_auto_added",
+                             side_effect=lambda *a: order.append("sweep")), \
+                patch.object(m, "verify"), patch.object(m, "write_json"):
+            m.restore(api, manifest, {}, self.restore_args())
+        self.assertEqual(order, ["item", "hierarchy", "sweep"])
+
+    def test_remove_auto_added_only_deletes_unwanted_descendants(self):
+        manifest = {"hierarchies": [
+            {"parent": "old/repo#1", "children": ["old/repo#2"]}]}
+        resolved = {"old/repo#1": {"repo": "new/repo", "number": 1},
+                    "old/repo#2": {"repo": "new/repo", "number": 2}}
+        plan = [{"target": {"id": "P"},
+                 "items": [{"kind": "Content", "key": "new/repo#1"}]}]
+        present = {"new/repo#1": {"id": "KEEP"}, "new/repo#2": {"id": "AUTO"},
+                   "new/repo#7": {"id": "OTHER"}}
+        with patch.object(m, "content_items", return_value=present), \
+                patch.object(m, "mutation") as mutation:
+            m.remove_auto_added(FakeAPI(), manifest, resolved, plan)
+        self.assertEqual([c.args[1] for c in mutation.call_args_list],
+                         ["deleteProjectV2Item"])
+        self.assertEqual(mutation.call_args.args[-1]["itemId"], "AUTO")
 
     def test_verify_does_not_claim_full_fidelity(self):
         manifest = self.manifest()

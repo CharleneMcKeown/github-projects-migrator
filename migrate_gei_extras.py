@@ -261,7 +261,7 @@ def fields(api, project_id):
     )
 
 
-def items(api, project_id):
+def items(api, project_id, values=True):
     result = api.pages(
         """query($id:ID!,$cursor:String) {
           node(id:$id) { ... on ProjectV2 {
@@ -281,7 +281,7 @@ def items(api, project_id):
           } }
         }""", ["node", "items"], id=project_id,
     )
-    for item in result:
+    for item in result if values else []:
         item["values"] = api.pages(
             """query($id:ID!,$cursor:String) {
               node(id:$id) { ... on ProjectV2Item {
@@ -815,6 +815,68 @@ def draft_identity(content):
     return content["title"], content.get("body") or ""
 
 
+def descendant_refs(manifest, resolved, roots):
+    """Destination refs below roots in the restored sub-issue hierarchy."""
+    children = {}
+    for hierarchy in manifest["hierarchies"]:
+        parent = resolved[hierarchy["parent"]]
+        children.setdefault(ref(parent["repo"], parent["number"]), []).extend(
+            ref(resolved[c]["repo"], resolved[c]["number"])
+            for c in hierarchy["children"])
+    found, stack = set(), list(roots)
+    while stack:
+        for child in children.get(stack.pop(), []):
+            if child not in found:
+                found.add(child)
+                stack.append(child)
+    return found
+
+
+def content_items(api, project_id):
+    result = {}
+    for item in items(api, project_id, values=False):
+        content = item["content"]
+        if content and content["__typename"] != "DraftIssue":
+            result[ref(content["repository"]["nameWithOwner"],
+                       content["number"])] = item
+    return result
+
+
+def add_item(api, project_id, content_id):
+    """GitHub auto-adds sub-issues with their parent, so the item may exist."""
+    try:
+        return mutation(api, "addProjectV2ItemById", "AddProjectV2ItemByIdInput",
+                        "item { id }", {"projectId": project_id,
+                                        "contentId": content_id})["item"]["id"]
+    except GraphQLError as error:
+        if "already exists" not in str(error):
+            raise
+    node = api.graphql(
+        """query($id:ID!) { node(id:$id) {
+          ... on Issue { projectItems(first:100,includeArchived:true) {
+            nodes { id project { id } } } }
+          ... on PullRequest { projectItems(first:100,includeArchived:true) {
+            nodes { id project { id } } } }
+        } }""", id=content_id,
+    )["node"]
+    matches = [i["id"] for i in node["projectItems"]["nodes"]
+               if i["project"]["id"] == project_id]
+    require(len(matches) == 1, f"Cannot locate existing item for {content_id}.")
+    return matches[0]
+
+
+def remove_auto_added(api, manifest, resolved, plans):
+    for plan in plans:
+        wanted = {i["key"] for i in plan["items"] if i["kind"] == "Content"}
+        allowed = descendant_refs(manifest, resolved, wanted) - wanted
+        for key, item in content_items(api, plan["target"]["id"]).items():
+            if key in allowed:
+                print(f"  Removing auto-added sub-issue item {key}", file=sys.stderr)
+                mutation(api, "deleteProjectV2Item", "DeleteProjectV2ItemInput",
+                         "deletedItemId", {"projectId": plan["target"]["id"],
+                                           "itemId": item["id"]})
+
+
 def project_plan(api, manifest, state, resolved):
     plans = []
     for source in manifest["projects"]:
@@ -884,14 +946,18 @@ def project_plan(api, manifest, state, resolved):
             wanted.add(key)
             planned.append({
                 "kind": "Content", "source": item, "label": item["reference"],
+                "key": key,
                 "destination": dest, "existing": existing.get(key), "values": values,
             })
-        require(set(existing) <= wanted,
-                f"Project {source['number']} has unexpected target issue/PR items; "
-                "disable auto-add workflows and review the project.")
+        extra = set(existing) - wanted
+        auto_added = extra & descendant_refs(manifest, resolved, wanted)
+        require(extra == auto_added,
+                f"Project {source['number']} has unexpected target issue/PR items "
+                f"{sorted(extra - auto_added)}; disable auto-add workflows and "
+                "review the project.")
         target["workflows"] = workflows(api, target["id"])
         plans.append({"source": source, "target": target, "entry": entry,
-                      "items": planned})
+                      "items": planned, "auto_added": sorted(auto_added)})
     return plans
 
 
@@ -910,6 +976,10 @@ def restore(api, manifest, state, args):
         print(f"DRY RUN: restore {sum(len(p['items']) for p in plans)} project items "
               f"and {sum(len(h['children']) for h in manifest['hierarchies'])} "
               "sub-issue links. All preflight mappings passed; no remote writes.")
+        for plan in plans:
+            if plan["auto_added"]:
+                print(f"  Will remove auto-added sub-issue items: "
+                      f"{plan['auto_added']}")
         if enabled:
             print("Disable these destination workflows before --execute:\n  "
                   + "\n  ".join(enabled))
@@ -922,18 +992,6 @@ def restore(api, manifest, state, args):
         "automated_checks": "not_completed",
         "manual_review_required": manifest["manual_checks"],
     })
-    for hierarchy in manifest["hierarchies"]:
-        parent = resolved[hierarchy["parent"]]
-        endpoint = f"repos/{parent['repo']}/issues/{parent['number']}/sub_issues"
-        existing = {item["id"] for item in api.rest_list(endpoint)}
-        children = [resolved[key] for key in hierarchy["children"]]
-        for child in children:
-            if child["id"] not in existing:
-                api.request(endpoint, "POST", {"sub_issue_id": child["id"],
-                                               "replace_parent": False})
-        for previous, child in zip(children, children[1:]):
-            api.request(endpoint + "/priority", "PATCH",
-                        {"sub_issue_id": child["id"], "after_id": previous["id"]})
     for plan in plans:
         target, entry = plan["target"], plan["entry"]
         # Items are added in source order, preserving relative manual ordering.
@@ -957,11 +1015,8 @@ def restore(api, manifest, state, args):
                     )["projectItem"]["id"],
                 )
             else:
-                item_id = mutation(
-                    api, "addProjectV2ItemById", "AddProjectV2ItemByIdInput",
-                    "item { id }", {"projectId": target["id"],
-                                    "contentId": item["destination"]["node_id"]},
-                )["item"]["id"]
+                item_id = add_item(api, target["id"],
+                                   item["destination"]["node_id"])
             for field, value in item["values"]:
                 payload = {"projectId": target["id"], "itemId": item_id,
                            "fieldId": field["id"]}
@@ -982,6 +1037,20 @@ def restore(api, manifest, state, args):
                     api, "archiveProjectV2Item", "ArchiveProjectV2ItemInput",
                     "item { id }", {"projectId": target["id"], "itemId": item_id},
                 )
+    # Sub-issues are linked after items so linking cannot pull extra items in.
+    for hierarchy in manifest["hierarchies"]:
+        parent = resolved[hierarchy["parent"]]
+        endpoint = f"repos/{parent['repo']}/issues/{parent['number']}/sub_issues"
+        existing = {item["id"] for item in api.rest_list(endpoint)}
+        children = [resolved[key] for key in hierarchy["children"]]
+        for child in children:
+            if child["id"] not in existing:
+                api.request(endpoint, "POST", {"sub_issue_id": child["id"],
+                                               "replace_parent": False})
+        for previous, child in zip(children, children[1:]):
+            api.request(endpoint + "/priority", "PATCH",
+                        {"sub_issue_id": child["id"], "after_id": previous["id"]})
+    remove_auto_added(api, manifest, resolved, plans)
     verify(api, manifest, state, args)
 
 
@@ -993,6 +1062,11 @@ def verify(api, manifest, state, args):
     check_target_identity(api, manifest, state, args)
     resolved = preflight(api, manifest)
     plans = project_plan(api, manifest, state, resolved)
+    for plan in plans:
+        require(not plan["auto_added"],
+                f"{plan['target']['url']} has auto-added sub-issue items not on the "
+                f"source project: {plan['auto_added']}. Rerun restore --execute "
+                "to remove them.")
     for hierarchy in manifest["hierarchies"]:
         parent = resolved[hierarchy["parent"]]
         children = api.rest_list(
