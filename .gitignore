@@ -1,0 +1,21 @@
+# Local migration inputs and generated outputs (default filenames).
+/repo-map.json
+/migration*.json
+/migration*.json.*
+
+# Migration logs and editor backups.
+*.log
+*.bak
+*.bak-*
+*~
+
+# Local credentials; only sanitized examples belong in version control.
+.env
+.env.*
+!.env.example
+
+# Python and operating-system artifacts.
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store

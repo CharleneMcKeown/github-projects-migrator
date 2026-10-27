@@ -1,0 +1,4 @@
+{
+  "old-org/application": "new-org/application",
+  "old-org/shared-library": "new-org/renamed-library"
+}
